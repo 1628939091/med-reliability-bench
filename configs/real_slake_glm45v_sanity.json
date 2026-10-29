@@ -1,0 +1,16 @@
+{
+  "data_dir": "data/real_slake",
+  "max_samples": 10,
+  "k_repeats": 1,
+  "perturbations": ["identity", "blank"],
+  "report": "outputs/report_glm45v_sanity.md",
+  "models": [
+    {
+      "backend": "api",
+      "name": "GLM-4.5V@SiliconFlow",
+      "base_url": "https://api.siliconflow.cn/v1",
+      "model": "zai-org/GLM-4.5V",
+      "temperature": 0.0
+    }
+  ]
+}

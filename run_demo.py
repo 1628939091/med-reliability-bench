@@ -40,7 +40,9 @@ def main() -> None:
     result = run_eval(config, data_dir=data_dir)
     print(f"      共产生 {len(result['records'])} 条评测记录")
 
-    out = os.path.join(HERE, "outputs", "report.md")
+    # 报告路径可由配置指定（多模型横评时避免互相覆盖 outputs/report.md）
+    out = os.path.join(HERE, config.get("report")
+                       or os.path.join("outputs", "report.md"))
     render_report(result, out)
     print(f"[3/3] 报告已生成: {out}")
     print("\n===== 核心指标速览 =====")

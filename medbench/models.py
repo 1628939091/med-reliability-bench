@@ -148,18 +148,62 @@ class OpenAICompatVLM:
                     time.sleep(wait)
                     continue
                 raise APITransientError(f"网络异常重试4次仍失败: {e}") from None
-        text = data["choices"][0]["message"]["content"]
+        msg = data["choices"][0].get("message") or {}
+        text = msg.get("content") or ""
+        if not str(text).strip():
+            # 思考型模型（GLM-4.5V / Qwen-Thinking 等）可能把正文放在
+            # reasoning_content，content 为空。不回退就会全部解析失败。
+            text = msg.get("reasoning_content") or ""
+        text = str(text)
         self.last_raw = text   # 保留原始回复，便于调试解析问题
-        return self._parse(text, options)
+        pred, conf = self._parse(text, options)
+        # 粗粒度格式遵循率统计：解析层完全没看到答案标记，说明是兜底值
+        if '"answer"' not in text and "答案" not in text and "answer" not in text.lower():
+            self.parse_fail = getattr(self, "parse_fail", 0) + 1
+        return pred, conf
 
     @staticmethod
     def _parse(text: str, options):
-        """从回复里抠出答案字母和置信度；解析失败按最保守处理。"""
-        m = re.search(r'"answer"\s*:\s*"([A-Za-z])"', text)
-        letter = (m.group(1).upper() if m else options[0])
-        pred = next((o for o in options if o.upper() == letter), options[0])
-        m2 = re.search(r'"confidence"\s*:\s*([0-9.]+)', text)
+        """从回复里抠出答案字母和置信度；解析失败按最保守处理。
+
+        兼容三类常见输出（跨模型必需，Qwen 与 GLM 的格式习惯不同）：
+          1. 严格 JSON：{"answer": "B", "confidence": 0.9}
+          2. 代码块包裹：```json { ... } ```
+          3. 自然语言：「答案：B」「The answer is B」
+        思考型模型会在正式答案前输出大段推理，所以**从后往前**取最后一个
+        答案标记——推理过程里出现的示例 JSON 不应被当成本题答案。
+        """
+        raw = (text or "")
+        # 剥掉 think 包裹段（部分平台把推理塞进 content）
+        raw = re.sub(r"<think[^>]*>.*?</think>", " ", raw, flags=re.S)
+
+        # 优先取最后一个含 answer 的 JSON 对象
+        cand = raw
+        blocks = re.findall(r"\{[^{}]*\"answer\"[^{}]*\}", raw)
+        if blocks:
+            cand = blocks[-1]
+
+        m = re.search(r'"answer"\s*:\s*"([A-Za-z])"', cand) or \
+            re.search(r'"answer"\s*:\s*([A-Za-z])', cand)
+        letter = m.group(1).upper() if m else None
+
+        if letter is None:                       # 自然语言兜底
+            opts = "".join(re.escape(o) for o in options)
+            hits = re.findall(
+                rf"(?:答案|answer\s*(?:is)?)\s*[:：]?\s*([{opts}])(?![A-Za-z])",
+                raw, flags=re.I)
+            if hits:
+                letter = hits[-1].upper()
+            else:
+                lone = [o for o in options if re.search(rf"\b{o}\b", raw)]
+                letter = lone[0] if len(lone) == 1 else None
+
+        pred = next((o for o in options if o.upper() == (letter or "")), options[0])
+        m2 = re.search(r'"confidence"\s*:\s*([0-9.]+)', cand) or \
+            re.search(r"confidence[^0-9]{0,12}([0-9.]+)", raw, flags=re.I)
         conf = float(m2.group(1)) if m2 else 0.5
+        if conf > 1.0:                            # 有的模型输出百分数
+            conf /= 100.0
         return pred, min(max(conf, 0.0), 1.0)
 
 

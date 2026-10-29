@@ -1,0 +1,16 @@
+{
+  "data_dir": "data/real_vqarad_subset",
+  "max_samples": 8,
+  "k_repeats": 1,
+  "perturbations": ["identity", "blank"],
+  "report": "outputs/report_vqarad_sanity.md",
+  "models": [
+    {
+      "backend": "api",
+      "name": "Qwen3-VL-8B@SiliconFlow",
+      "base_url": "https://api.siliconflow.cn/v1",
+      "model": "Qwen/Qwen3-VL-8B-Instruct",
+      "temperature": 0.0
+    }
+  ]
+}
