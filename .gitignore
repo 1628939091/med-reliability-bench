@@ -1,0 +1,23 @@
+# 环境与缓存
+.venv/
+__pycache__/
+*.pyc
+.idea/
+
+# 原始数据（500MB+，按 README 自行下载）
+data/raw/
+data/processed/
+
+# 自动生成的演示数据与扰动缓存（跑一次就会重建）
+data/demo/
+data/*/perturb_cache/
+
+# 中间产物（适配器的直接输出，评测集另有提交）
+data/real/
+
+# 运行产物（评测记录、报告、图表）
+outputs/
+
+# 文档 PDF（由 md 生成，不入库）
+*.pdf
+.build/
