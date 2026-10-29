@@ -50,18 +50,36 @@ python analyze_full.py                                # 分层统计 + 出图
 
 ```
 med-reliability-bench/
-├── run_demo.py               # 一键入口
-├── configs/demo_config.json  # 评测配置（换模型/换数据在这里改）
+├── run_demo.py                 # 一键入口（配置驱动）
+├── analyze_full.py             # 阶段 3：聚类 Bootstrap / McNemar / 分层 / 出图
+├── debug_vlm.py                # 逐题调试：打印模型原始回复与解析结果
+├── configs/
+│   ├── demo_config.json        # Mock 演示（40 题合成数据，零成本）
+│   ├── real_slake_mock.json    # 真实 SLAKE 数据 + Mock 模型
+│   ├── real_slake_api_sanity.json  # 10 题 sanity check（几分钱）
+│   └── real_slake_api_full.json    # 全量 355 题 × 7 扰动 × 3 次
 ├── medbench/
-│   ├── data.py               # 数据层：JSONL 格式定义 + 40 题演示集生成（含合成"医学影像"PNG）
-│   ├── perturb.py            # 扰动套件：空白/噪声/翻转/换图/低分辨率/纯文本（6+1 种）
-│   ├── models.py             # 模型后端：MockVLM(4 种缺陷行为) + OpenAI兼容API
-│   ├── metrics.py            # 统计武器库：Bootstrap CI / 坍缩差 / pass^k / 熵 / ECE
-│   ├── runner.py             # 编排器：模型 × 扰动 × 题目 × k 次重复
-│   └── report.py             # 报告生成：Markdown 表格 + 自动诊断结论
-├── outputs/report.md         # 运行后的评测报告
-└── data/demo/                # 自动生成的演示数据集
+│   ├── adapters.py             # 适配层：SLAKE / VQA-RAD / PathVQA → 统一 JSONL
+│   ├── data.py                 # 数据层：Sample 结构 + 演示集生成
+│   ├── perturb.py              # 扰动套件：7 种破坏 + 缓存 + 降级可见
+│   ├── models.py               # 模型层：MockVLM(4 种缺陷人格) + OpenAI 兼容 API
+│   ├── metrics.py              # 指标层：Bootstrap CI / 坍缩差 / pass^k / 熵 / ECE
+│   ├── runner.py               # 编排层：三级容错 + 断点续跑 + 拒答捕获
+│   └── report.py               # 报告层：Markdown 表格 + 自动诊断
+├── data/real_slake/dataset.jsonl       # 355 道闭集题（含 lang/modality 元数据）
+├── data/real_vqarad/dataset.jsonl      # 1,193 道闭集题（交叉验证用）
+└── outputs/                    # 评测记录 / 报告 / 图表（运行时生成）
 ```
+
+> 原始数据（SLAKE 212MB、VQA-RAD 315 张图）不入库，按第 3 章「怎么换成真实实验数据」自行下载。
+
+## 文档
+
+| 文档 | 内容 |
+|---|---|
+| [项目一_从零到面试_完整教程.md](项目一_从零到面试_完整教程.md) | 13 章 + 3 附录：概念入门 → 架构 → 数据 → 扰动 → 指标 → 统计 → API 接入 → 结果解读 → **8 个踩坑复盘** → **20 题面试题库（含答案）** → 50 个术语表 |
+| [项目一_行动路线.md](项目一_行动路线.md) | 六阶段路线 + 每日进度日志 + 坑的原始记录 |
+| `outputs/analysis_full.md` | 分层分析报告（运行 `analyze_full.py` 生成） |
 
 ## 快速开始
 
