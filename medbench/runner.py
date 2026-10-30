@@ -69,9 +69,13 @@ def run_eval(config: dict, data_dir: str | None = None) -> dict:
             for s in samples:
                 other = None
                 if pert == "swap":  # 换成另一道题的图
-                    other_img = next(
-                        (x.image for x in samples if x.image != s.image),
-                        s.image)
+                    # 旧实现用 next() 取「第一张不同的图」→ 所有题换到同一张固定图，
+                    # 使 swap 退化成 fixed-image 条件（VQA-RAD 上 swap 反而高于 blank 即此因）。
+                    # 现按题随机抽一张不同的图，种子绑定 sid 保证断点续跑可复现。
+                    _imgs = sorted({x.image for x in samples})
+                    _cands = [x for x in _imgs if x != s.image]
+                    other_img = random.Random(f"swap|{s.sid}").choice(_cands) \
+                        if _cands else s.image
                     other = os.path.join(os.path.dirname(jsonl), other_img) \
                         if not os.path.isabs(other_img) else other_img
                 img = suite.apply(
