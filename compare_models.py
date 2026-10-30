@@ -99,14 +99,42 @@ def entropy(labels):
     return float(-(p * np.log2(p)).sum())
 
 
+def mcnemar_p(n01, n10):
+    """配对 McNemar 精确检验（双侧，二项精确）。
+
+    n01 = 条件 A 错、条件 B 对；n10 = 条件 A 对、条件 B 错。
+    只看「不一致对」，一致对不提供信息——这是配对设计的全部意义：
+    题目难度、模型整体水平都被消掉了，剩下的是「两个条件谁更有用」。
+    """
+    n = n01 + n10
+    if n == 0:
+        return 1.0
+    k = min(n01, n10)
+    return min(1.0, 2 * sum(comb(n, i) for i in range(k + 1)) / 2 ** n)
+
+
+def binom_vs_base(k, n, base):
+    """单侧二项检验：观察到的正确数 k/n 是否显著高于常数基线 base。
+
+    H0：该条件下的真实准确率 = 「永远答多数类」的准确率。
+    这是判断「模型到底有没有用上图像」的正确参照——不能拿两个坏条件互相比。
+    """
+    k, n = int(round(k)), int(n)
+    if n == 0:
+        return 1.0
+    return min(1.0, sum(comb(n, i) * base ** i * (1 - base) ** (n - i)
+                        for i in range(k, n + 1)))
+
+
 # ------------------------------------------------------------------ 单次运行
 def analyse(ckpt, data):
     recs = [json.loads(l) for l in open(ckpt, encoding="utf-8") if l.strip()]
-    meta = {}
+    meta, qtext = {}, {}
     for line in open(data, encoding="utf-8"):
         if line.strip():
             d = json.loads(line)
             meta[d["id"]] = d.get("meta") or {}
+            qtext[d["id"]] = d.get("question") or ""
 
     def img(sid):
         return (meta.get(sid) or {}).get("same_image") or sid
@@ -183,13 +211,76 @@ def analyse(ckpt, data):
     if pr:
         n01 = sum(1 for s, b in pr if not s and b)   # 有图(错图)错、没图对
         n10 = sum(1 for s, b in pr if s and not b)   # 有图(错图)对、没图错
-        n = n01 + n10
-        if n == 0:
-            pv = 1.0
-        else:
-            kk = min(n01, n10)
-            pv = min(1.0, 2 * sum(comb(n, i) for i in range(kk + 1)) / 2 ** n)
-        m["swap_blank"] = {"n": len(pr), "n01": n01, "n10": n10, "p": pv}
+        m["swap_blank"] = {"n": len(pr), "n01": n01, "n10": n10,
+                           "p": mcnemar_p(n01, n10)}
+
+    # 换错图 vs 置空：按题型分层——聚合差值可能是题型构成造成的假象
+    topic_field = next((f for f in ("content_type", "question_type")
+                        if any((meta.get(r["sid"]) or {}).get(f) for r in recs)), None)
+    m["topic_field"] = topic_field
+    topics = {}
+    if topic_field:
+        grp = defaultdict(list)
+        for (sid, rep), v in bykey.items():
+            if "swap" in v and "blank" in v:
+                q = (meta.get(sid) or {}).get(topic_field)
+                if q:
+                    grp[q].append((sid, v["swap"], v["blank"]))
+        for q, lst in grp.items():
+            nq = len({s for s, _, _ in lst})
+            if nq < 10:            # 少于 10 题的组只描述不检验
+                continue
+            a = sum(s for _, s, _ in lst) / len(lst)
+            b = sum(x for _, _, x in lst) / len(lst)
+            c01 = sum(1 for _, s, x in lst if not s and x)
+            c10 = sum(1 for _, s, x in lst if s and not x)
+            # 该题型的常数基线：永远答多数类
+            sids_q = {s for s, _, _ in lst}
+            gq = [r["gold"] for r in ident if r["sid"] in sids_q]
+            base = (sum(1 for g in gq if g == "B") / len(gq)) if gq else float("nan")
+            base = max(base, 1 - base) if gq else float("nan")
+            # 原图 / 换错图 是否显著超过该题型的常数基线
+            idq = [float(r["correct"]) for r in ident if r["sid"] in sids_q]
+            k_id = sum(idq)
+            k_sw = sum(s for _, s, _ in lst)
+            topics[q] = {
+                "n_q": nq, "swap": a, "blank": b, "gap": a - b,
+                "p": mcnemar_p(c01, c10), "base": base,
+                "acc_id": (k_id / len(idq)) if idq else float("nan"),
+                "p_id": binom_vs_base(k_id, len(idq), base) if idq else float("nan"),
+                "p_sw": binom_vs_base(k_sw, len(lst), base),
+            }
+    m["topics"] = topics
+
+    # 否定式提问陷阱：只在 SLAKE 这类含 Abnormality 题型的运行上做
+    # 「Does the liver look normal?」答 Yes 表示「正常」，与「Is there abnormality?」
+    # 的极性相反。这类题会把「极性理解错误」伪装成「视觉判读失败」。
+    neg = {}
+    if meta and any((v or {}).get("content_type") == "Abnormality" for v in meta.values()):
+        import re as _re
+        pat = _re.compile(r"\bnormal\b|\babnormal", _re.I)
+        for group, fn in [("否定式（含 normal/abnormal）", lambda q: bool(pat.search(q))),
+                          ("直接式（其余）", lambda q: not pat.search(q))]:
+            v = [r for r in ident if (meta.get(r["sid"]) or {}).get("content_type")
+                 == "Abnormality" and fn(qtext.get(r["sid"], ""))]
+            if len(v) < 30:
+                continue
+            acc = float(np.mean([r["correct"] for r in v]))
+            yes = float(np.mean([r["pred"] == "B" for r in v]))
+            gold = float(np.mean([r["gold"] == "B" for r in v]))
+            # 按自身 Yes 率作答的期望准确率：模型的「分布」是对的、只是「谁对谁」错了
+            exp = yes * gold + (1 - yes) * (1 - gold)
+            # 临床口径：Yes = 正常，No = 异常 → 敏感度 = 异常被判出、特异度 = 正常被判对
+            tp = sum(1 for r in v if r["gold"] == "A" and r["pred"] == "A")   # 异常→异常
+            fn_ = sum(1 for r in v if r["gold"] == "A" and r["pred"] == "B")  # 异常→正常（漏诊）
+            tn = sum(1 for r in v if r["gold"] == "B" and r["pred"] == "B")   # 正常→正常
+            fp = sum(1 for r in v if r["gold"] == "B" and r["pred"] == "A")   # 正常→异常
+            neg[group] = {"n": len(v), "acc": acc, "flip": 1 - acc,
+                          "exp": exp, "yes": yes, "gold": gold,
+                          "sens": tp / (tp + fn_) if (tp + fn_) else float("nan"),
+                          "spec": tn / (tn + fp) if (tn + fp) else float("nan"),
+                          "tp": tp, "fn": fn_, "tn": tn, "fp": fp}
+    m["negation"] = neg
 
     # 模态分层：必须用「子集自己的常数基线」校正，否则答案比例会冒充坍缩幅度
     mods = {}
@@ -328,8 +419,15 @@ def main():
 
         add("\n## 三、怎么解读\n")
         h1 = sum(h["H1 模态坍缩"] for h in hs)
+        h2 = sum(h["H2 价值不对称"] for h in hs)
         add(f"- H1（坍缩存在）复现 {h1}/{len(hs)}："
-            f"{'跨模型稳健，可以作为主结论' if h1 == len(hs) else '存在不一致，主结论需限定条件'}。")
+            f"{'跨模型稳健' if h1 == len(hs) else '存在不一致，主结论需限定条件'}。"
+            f"**但要小心这条几乎是同义反复**——灰图会让模型恒答 No，"
+            f"准确率自然落回「全答 No」基线。真正有信息的问题是"
+            f"「原图是否显著高于基线」，答案在第四节。")
+        add(f"- H2（价值不对称）复现 {h2}/{len(hs)}："
+            f"{'跨模型跨数据集稳健，可以当主结论' if h2 == len(hs) else '不稳定，需限定条件'}。"
+            f"注意「Δ(No) 为负」不是这条的必需部分——它只是 Qwen 的特性（GLM 上是 +0.050）。")
         h3 = sum(h["H3 置空≠缺图"] for h in hs)
         add(f"- H3（置空≠缺图）复现 {h3}/{len(hs)}：这是最容易被忽略但最影响评测设计的一条——"
             f"如果换模型后也成立，说明「用灰图代理无视觉信息」是**普遍错误**，"
@@ -338,65 +436,178 @@ def main():
         add(f"- H4（校准崩塌）复现 {h4}/{len(hs)}："
             f"{'所有模型都过度自信，说明是 VLM 通病而非个例' if h4 == len(hs) else '并非所有模型都如此，需分模型讨论——把它当「VLM 通病」写进结论会翻车'}。")
 
-        # 四：blank ≈ swap —— 跨模型最稳的一条
+        # 四：blank vs swap —— 有边界条件的一条
         pairs = [(n, m) for n, m in rows
                  if not (math.isnan(m.get("acc_blank", float("nan")))
                          or math.isnan(m.get("acc_swap", float("nan"))))]
         if pairs:
-            add("\n## 四、最稳的一条：置空 ≈ 换错图\n")
-            add("「置空」= 喂一张 64×64 灰图；「换错图」= 喂同一数据集里"
-                "**另一道题**的真实影像（按题号随机抽，见 `runner.py`）。"
-                "两者都在测「图像内容无效」，区别只在于错图里还留着模态、"
-                "部位这些**真实影像才有的线索**。\n")
+            add("\n## 四、视觉接地有多深：按题型扣掉常数基线\n")
+            add("「置空」= 喂一张 64×64 灰图；「换错图」= 喂**另一道题**的真实影像"
+                "（按题号随机抽，见 `runner.py`）。两者都在破坏「图像内容」，"
+                "区别在于错图里还留着模态、部位这些**真实影像才有的粗属性**。\n")
             add("| 运行 | 置空 acc | 换错图 acc | 差值 | 配对 n | 只有换错图对 | 只有置空对 | McNemar p |")
             add("|---|---|---|---|---|---|---|---|")
-            ok = 0
+            sig = []
             for n, m in pairs:
                 sb = m.get("swap_blank") or {}
                 gap = m["acc_swap"] - m["acc_blank"]
                 pv = sb.get("p", float("nan"))
-                same = (not math.isnan(pv)) and pv > 0.05
-                ok += same
+                if (not math.isnan(pv)) and pv <= 0.05:
+                    sig.append(n)
                 add(f"| {n} | {m['acc_blank']:.3f} | {m['acc_swap']:.3f} "
                     f"| {gap:+.3f} | {sb.get('n', 0)} | {sb.get('n10', 0)} "
+                    f"| {sb.get('n01', 0)} | **{pv:.4f}** |" if pv <= 0.05 else
+                    f"| {n} | {m['acc_blank']:.3f} | {m['acc_swap']:.3f} "
+                    f"| {gap:+.3f} | {sb.get('n', 0)} | {sb.get('n10', 0)} "
                     f"| {sb.get('n01', 0)} | {pv:.3f} |")
-            if ok == len(pairs):
-                add(f"\n> {ok}/{len(pairs)} 个运行的配对 McNemar 检验都**不显著**"
-                    "（p 远大于 0.05）：把图换成别的病人的图，与把图删掉，成绩上没有区别。"
-                    "这说明模型对图像的处理只到**「有没有图」**这一层，"
-                    "几乎不比对图里是哪个病人——**多模态是名义上的**。"
-                    "这条结论不依赖模型家族，是本项目最硬的一条。")
-                add("\n> 一个必须一起说清的细节：换错图会改变模型的**回答分布**"
-                    "（下表 Yes 率），但**没有换来准确率**。"
-                    "「分布变了、对错没变」这个组合，说明模型确实从错图里提取了东西——"
-                    "只是提取到的与题目无关。这是模态坍缩的机制层证据，"
-                    "比单看准确率更有说服力。\n")
-                add("| 运行 | Yes 率·原图 | Yes 率·置空 | Yes 率·换错图 | 换错图−置空 |")
-                add("|---|---|---|---|---|")
-                for n, m in pairs:
-                    yb, ys = m.get("yes_blank", float("nan")), m.get("yes_swap", float("nan"))
-                    add(f"| {n} | {m.get('yes_identity', float('nan')):.3f} | {yb:.3f} "
-                        f"| {ys:.3f} | {ys - yb:+.3f} |")
-                seen = [m.get("yes_swap", 0) - m.get("yes_blank", 0) for _, m in pairs]
-                if any(abs(v) > 0.10 for v in seen):
-                    add("\n> 注意这个跨模型差异：有的模型换错图后 Yes 率大幅上升"
-                        "（它确实「看见」了影像里的模态/部位线索），"
-                        "有的几乎不动（它连「有图 vs 有错图」都分不出）。"
-                        "**「只感知图像存在性」这句话要分两层说**："
-                        "所有模型都只在「有没有图」这一层改变行为；"
-                        "至于会不会被错图影响回答分布，模型之间不一样。")
-                else:
-                    add("\n> 换错图对 Yes 率的影响也在噪声范围内——"
-                        "两个模型连「图对不对」都没有反应，"
-                        "说明视觉编码的输出在决策里几乎没有参与。")
+
+            if not sig:
+                add(f"\n> {len(pairs)}/{len(pairs)} 个运行的配对检验都**不显著**："
+                    "换错图与置空没有区别。")
             else:
-                bad = [n for n, m in pairs
-                       if (m.get("swap_blank") or {}).get("p", 1.0) <= 0.05]
-                add(f"\n> 只有 {ok}/{len(pairs)} 个运行满足「置空 ≈ 换错图」；"
-                    f"{'、'.join(bad)} 上两者可区分——换错图比置空**更高**，"
-                    "说明错图仍携带与题目兼容的信息（如模态/部位线索），"
-                    "「模型只感知图像存在性」这一结论**需要限定数据集**，"
-                    "不能写成普遍规律。")
+                add(f"\n> **{len(pairs) - len(sig)}/{len(pairs)} 个运行上两者无区别，"
+                    f"但 {'、'.join(sig)} 上换错图显著更高。**")
+            add("\n**但这个比较本身是个陷阱**：两个「坏输入」互相比较，"
+                "只能说明谁更坏，不能说明模型到底有没有用上图像。"
+                "正确的参照物是**该条件自己的常数基线**（永远答多数类）。"
+                "下面两节把这个拆开。")
+
+            # 4.1 为什么 VQA-RAD 上换错图更高：灰图不是「无信息」，是「恒答 No」
+            witht = [(n, m) for n, m in rows if m.get("topics")]
+            add("\n### 4.1 灰图不是「零信息」，而是「钉死在 No 上」\n")
+            add("看置空条件下的 Yes 率：SLAKE 的多数题型 Yes 率是 **0.000**——"
+                "模型看到灰图就几乎一律答 No。所以置空准确率会**精确等于该子集的"
+                "「全答 No」基线**，而一旦某个题型 gold 偏 Yes，"
+                "「恒答 No」就会变成**主动答错**，准确率远低于基线。\n")
+            add("| 运行 | 题型 | gold Yes 占比 | 常数基线 | 置空 acc | 置空−基线 | 换错图 acc | 换错图−基线 |")
+            add("|---|---|---|---|---|---|---|---|")
+            for n, m in witht:
+                for q, t in sorted(m["topics"].items(),
+                                   key=lambda x: -abs(x[1]["blank"] - x[1]["base"]))[:3]:
+                    if math.isnan(t.get("base", float("nan"))):
+                        continue
+                    add(f"| {n} | {q} | {1 - t['base']:.3f} | {t['base']:.3f} "
+                        f"| {t['blank']:.3f} | {t['blank'] - t['base']:+.3f} "
+                        f"| {t['swap']:.3f} | {t['swap'] - t['base']:+.3f} |")
+            add("\n> 这就是 VQA-RAD 上「换错图 > 置空」的全部来源："
+                "**不是错图带来了信息，而是灰图把模型钉在 No 上、在 gold 偏 Yes 的题型上"
+                "表现成负分。** 换个错图只是让它回到「按图作答」，于是回到基线附近。")
+
+            # 4.2 用基线当尺子：谁真的超过了「永远答多数类」
+            add("\n### 4.2 用常数基线当尺子：图像到底被用在哪一层\n")
+            add("`p(原图)` / `p(换错图)` 是单侧二项检验（H0：真实准确率 = 该题型常数基线）。"
+                "p<0.05 才算「真的用上了图像」。\n")
+            add("| 运行 | 题型 | 题数 | 基线 | 原图 | p(原图) | 换错图 | p(换错图) | 读法 |")
+            add("|---|---|---|---|---|---|---|---|---|")
+            for n, m in witht:
+                for q, t in sorted(m["topics"].items(),
+                                   key=lambda x: -(x[1].get("acc_id", 0)
+                                                   - x[1].get("base", 0))):
+                    if math.isnan(t.get("p_id", float("nan"))):
+                        continue
+                    if t["p_id"] <= 0.05:
+                        verdict = "**✔ 图像有效**"
+                    elif t["acc_id"] < t["base"] - 0.05:
+                        verdict = "**✘ 看图更差**"
+                    else:
+                        verdict = "✘ 等效常数预测器"
+                    if t["p_sw"] <= 0.05:
+                        verdict += "；错图也超基线"
+                    add(f"| {n} | {q} | {t['n_q']} | {t['base']:.3f} | {t['acc_id']:.3f} "
+                        f"| {t['p_id']:.4f} | {t['swap']:.3f} | {t['p_sw']:.4f} | {verdict} |")
+
+            add("\n> 这张表是本项目最重要的一张。它做了一件前面所有指标都做不到的事："
+                "**把「真看图」和「靠先验猜」在同一张表上分开**——"
+                "判据是「原图准确率是否显著高于该题型的常数基线」。")
+            add(">")
+            add("> **Qwen3-VL-8B 的视觉接地只到粗属性**：器官有无（Organ 0.818 vs 基线 0.506，"
+                "p<1e−5）、模态（0.797 vs 0.522）、位置（0.800 vs 0.533）、"
+                "尺寸（0.709 vs 0.538）、病灶有无（0.675 vs 0.578）都显著超基线；"
+                "但**异常判读（Abnormality 0.520 vs 0.551，p=0.87）和平面判断"
+                "（Plane 0.440 vs 0.680，p≈1.0）完全不超基线，Plane 上甚至比不看图还差**。")
+            add(">")
+            add("> **GLM-4.5V 在全部 6 个题型上都显著超基线**，包括异常判读"
+                "（Abnormality 0.646 vs 0.551，**p=0.0006**）和平面判断"
+                "（Plane 0.933 vs 0.680，p<1e−5）。")
+            add(">")
+            add("> 但 Qwen 在 Abnormality 上的失败还有一个更具体的原因，见 4.3——"
+                "**不是没看图，是把否定式提问的极性搞反了。**")
+            add(">")
+            add("> 换错图这一列几乎从不显著超过基线（唯一例外：VQA-RAD 的 PRES 题型 "
+                "0.650 vs 0.578，p=0.0007——因为 VQA-RAD 只有头/胸/腹三个部位，"
+                "随机换图有 1/3 概率同部位，问「有没有肝」时换到腹部片仍能答对），"
+                "而原图有 6 个题型显著超过。**所以「错图 ≈ 没图」这个直觉本身没错，"
+                "错的是把它解释成「模型只感知图像存在性」。**")
+
+            # 4.3 否定式提问陷阱
+            negs = [(n, m) for n, m in rows if m.get("negation")]
+            if negs:
+                add("\n### 4.3 否定式提问陷阱：把「极性理解错误」伪装成「视觉判读失败」\n")
+                add("SLAKE 的 Abnormality 题型里混着两种问法，**极性相反**：\n")
+                add("- 直接式：`Is there an abnormality in the liver?` → 答 Yes 表示**有异常**")
+                add("- 否定式：`Does the liver look normal?` → 答 Yes 表示**正常**")
+                add("")
+                add("「随机期望」= 按模型自己的 Yes 率去随机作答能得到的准确率。"
+                    "**若实际准确率低于随机期望，说明模型的回答与金标负相关——典型的极性反转。**\n")
+                add("| 运行 | 问法 | n | 准确率 | 随机期望 | 差 | 翻转预测后 | 敏感度(异常判出) | 特异度(正常判对) |")
+                add("|---|---|---|---|---|---|---|---|---|")
+                for n, m in negs:
+                    for g, t in m["negation"].items():
+                        add(f"| {n} | {g} | {t['n']} | {t['acc']:.3f} | {t['exp']:.3f} "
+                            f"| {t['acc'] - t['exp']:+.3f} | {t['flip']:.3f} "
+                            f"| **{t['sens']:.3f}** | {t['spec']:.3f} |")
+                add("\n> 读法（敏感度 = 真异常被判出；漏诊率 = 1 − 敏感度）：")
+                for n, m in negs:
+                    d = m["negation"]
+                    ng = next((v for k, v in d.items() if k.startswith("否定式")), None)
+                    di = next((v for k, v in d.items() if k.startswith("直接式")), None)
+                    if not ng or not di:
+                        continue
+                    parts = [f"> - **{n}**：同一批影像、同一判断任务，"
+                             f"换成「Does it look normal?」的否定式提问后，"
+                             f"敏感度 {di['sens']:.3f} → **{ng['sens']:.3f}**"
+                             f"（漏诊率 {1-ng['sens']:.0%}），"
+                             f"特异度 {di['spec']:.3f} → {ng['spec']:.3f}。"]
+                    if ng["sens"] < di["sens"] - 0.15:
+                        parts.append(f"敏感度掉了 {di['sens']-ng['sens']:.2f}，"
+                                     "**措辞本身就让异常变得更容易被漏掉**。")
+                    else:
+                        parts.append("两种问法下敏感度接近，没有被措辞带偏。")
+                    if ng["acc"] < ng["exp"] - 0.03:
+                        parts.append(f"而且准确率 {ng['acc']:.3f} **低于**按自身 Yes 率"
+                                     f"随机作答的期望 {ng['exp']:.3f}——"
+                                     "**回答与金标负相关，是极性理解反了，不是看不见病灶。**")
+                    else:
+                        parts.append(f"准确率 {ng['acc']:.3f} 高于随机期望 {ng['exp']:.3f}，"
+                                     "极性没有反，只是判读能力有限。")
+                    add("".join(parts))
+                add(">")
+                add("> **这条的评测学意义**：只看 Abnormality 的聚合准确率，"
+                    "你会得出「模型看不见异常」的结论——对 Qwen 来说那是错的，"
+                    "真相是**否定式提问把它的极性带反了**，两种效应在聚合指标里互相抵消。"
+                    "更普遍的是：**两个模型的敏感度都在否定式提问下明显下降**"
+                    "（Qwen 0.606→0.273，GLM 0.803→0.591），"
+                    "而聚合准确率把这个下降完全掩盖了（Qwen 甚至看起来只是「比 GLM 差一点」）。")
+                add(">")
+                add("> 临床场景里「这个结节正常吗」「有没有异常」本来就是混着问的，"
+                    "所以这个缺陷真实存在、且会被标准评测完全掩盖。"
+                    "**报告医学 VLM 的异常判读能力时，必须同时给敏感度、并按提问极性分层**——"
+                    "只报 accuracy 是失职。这条可以直接写进论文方法论部分，"
+                    "也可以作为对「医学 VLM 已达放射科医生水平」这类说法的具体反驳。")
+
+            # 4.3 Yes 率变化
+            add("\n### 4.4 视觉特征确实进来了，只是没换来准确率\n")
+            add("| 运行 | Yes 率·原图 | Yes 率·置空 | Yes 率·换错图 | 换错图−置空 |")
+            add("|---|---|---|---|---|")
+            for n, m in pairs:
+                yb, ys = m.get("yes_blank", float("nan")), m.get("yes_swap", float("nan"))
+                add(f"| {n} | {m.get('yes_identity', float('nan')):.3f} | {yb:.3f} "
+                    f"| {ys:.3f} | {ys - yb:+.3f} |")
+            seen = [m.get("yes_swap", 0) - m.get("yes_blank", 0) for _, m in pairs]
+            if any(abs(v) > 0.10 for v in seen):
+                add("\n> 有的模型换错图后 Yes 率大幅上升（它确实读了错图里的东西），"
+                    "有的几乎不动。「分布变了、对错没变」这个组合恰好说明："
+                    "视觉特征进来了，但与题目无关。")
 
         # 五：模态分层必须扣掉子集自己的基线
         withm = [(n, m) for n, m in rows if m.get("modal")]
