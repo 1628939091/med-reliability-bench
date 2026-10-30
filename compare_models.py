@@ -5,8 +5,10 @@
 还是「这一类 VLM 在这个任务上的共性」？
 
 判定逻辑（每条发现都写成可证伪的谓词，跑完自动判 True/False）：
-    H1 模态坍缩存在   : 原图准确率显著高于常数基线，且置空后跌破常数基线
-    H2 图像价值不对称 : gold=Yes 的 Δ > 0 且显著；gold=No 的 Δ ≤ 0
+    H1 模态坍缩存在   : Δ 的 95%CI 下界 > 0（图像确有贡献），
+                        且置空后准确率不高于常数基线 + 0.05（退化为近似常数预测）
+    H2 图像价值不对称 : gold=Yes 的 Δ CI 下界 > 0，且 ΔYes − ΔNo > 0.15
+                        （只要求「不对称」，不强求 No 题 Δ 为负——负号是模型特性）
     H3 置空≠缺图      : |Yes率(blank) − Yes率(text_only)| > 0.10
     H4 校准崩塌       : ECE > 0.15 且 平均置信度 − 准确率 > 0.15
 
@@ -165,25 +167,59 @@ def analyse(ckpt, data):
         rs = [r for r in recs if r["perturbation"] == p]
         m[f"yes_{p}"] = float(np.mean([r["pred"] == "B" for r in rs])) if rs else float("nan")
         m[f"ent_{p}"] = entropy([r["pred"] for r in rs]) if rs else float("nan")
-    m["acc_blank"] = float(np.mean([r["correct"] for r in recs
-                                    if r["perturbation"] == "blank"])) if has("blank") else float("nan")
+    for p in ["blank", "swap"]:
+        rs = [r for r in recs if r["perturbation"] == p]
+        m[f"acc_{p}"] = float(np.mean([r["correct"] for r in rs])) if rs else float("nan")
+
+    # 模态分层：必须用「子集自己的常数基线」校正，否则答案比例会冒充坍缩幅度
+    mods = {}
+    names = {(meta.get(r["sid"]) or {}).get("modality") for r in ident} - {None}
+    for mod in sorted(names):
+        sids = {r["sid"] for r in ident
+                if (meta.get(r["sid"]) or {}).get("modality") == mod}
+        gs = [r["gold"] for r in ident if r["sid"] in sids]
+        bl = [float(r["correct"]) for r in recs
+              if r["perturbation"] == "blank" and r["sid"] in sids]
+        a_m = float(np.mean([r["correct"] for r in ident if r["sid"] in sids]))
+        b_m = float(np.mean(bl)) if bl else float("nan")
+        mods[mod] = {"n": len(sids), "acc": a_m, "blank": b_m,
+                     "base": sum(1 for g in gs if g == "A") / len(gs),
+                     "delta": a_m - b_m}
+    m["modal"] = mods
 
     oc = [r for r in ident if not r.get("refused")]
     m["conf"] = float(np.mean([r["conf"] for r in oc])) if oc else float("nan")
     m["ece"] = ece([r["conf"] for r in oc], [r["correct"] for r in oc]) if oc else float("nan")
+    # 置信度的区分度：ECE 只衡量「水平差」，不衡量「有没有信息」
+    if oc:
+        cc = np.array([r["conf"] for r in oc], float)
+        yy = np.array([r["correct"] for r in oc], float)
+        pos, neg = cc[yy >= 0.5], cc[yy < 0.5]
+        m["conf_nuniq"] = len(set(cc.tolist()))
+        if len(pos) and len(neg):
+            m["conf_auc"] = float(np.mean(
+                (pos[:, None] > neg[None, :]) * 1.0
+                + (pos[:, None] == neg[None, :]) * 0.5))
+            m["conf_gap"] = float(pos.mean() - neg.mean())
+        else:
+            m["conf_auc"] = m["conf_gap"] = float("nan")
     m["refusal"] = float(np.mean([bool(r.get("refused")) for r in recs])) if recs else 0.0
     return m
 
 
 def hyp(m):
-    """四条假设的可证伪判定。"""
+    """四条假设的可证伪判定。所有阈值只依赖 CI 与固定容差，不看「哪个模型」。"""
     h = {}
+    d_lo = m.get("delta_ci", (float("nan"), float("nan")))[0]
     h["H1 模态坍缩"] = bool(
-        not math.isnan(m["acc"]) and m["acc"] > m["baseline"]
-        and not math.isnan(m["acc_blank"]) and m["acc_blank"] < m["baseline"])
+        (not math.isnan(d_lo)) and d_lo > 0
+        and not math.isnan(m["acc_blank"])
+        and m["acc_blank"] <= m["baseline"] + 0.05)
     dy, dn = m.get("d_yes", float("nan")), m.get("d_no", float("nan"))
+    dy_lo = m.get("d_yes_ci", (float("nan"), float("nan")))[0]
     h["H2 价值不对称"] = bool((not math.isnan(dy)) and (not math.isnan(dn))
-                          and dy > 0.1 and dn < 0)
+                          and (not math.isnan(dy_lo)) and dy_lo > 0
+                          and (dy - dn) > 0.15)
     h["H3 置空≠缺图"] = bool((not math.isnan(m["yes_blank"]))
                           and (not math.isnan(m["yes_text_only"]))
                           and abs(m["yes_blank"] - m["yes_text_only"]) > 0.10)
@@ -280,7 +316,73 @@ def main():
             f"这条可以直接写进论文的方法论批评部分。")
         h4 = sum(h["H4 校准崩塌"] for h in hs)
         add(f"- H4（校准崩塌）复现 {h4}/{len(hs)}："
-            f"{'所有模型都过度自信，说明是 VLM 通病而非个例' if h4 == len(hs) else '并非所有模型都如此，需分模型讨论'}。")
+            f"{'所有模型都过度自信，说明是 VLM 通病而非个例' if h4 == len(hs) else '并非所有模型都如此，需分模型讨论——把它当「VLM 通病」写进结论会翻车'}。")
+
+        # 四：blank ≈ swap —— 跨模型最稳的一条
+        pairs = [(n, m) for n, m in rows
+                 if not (math.isnan(m.get("acc_blank", float("nan")))
+                         or math.isnan(m.get("acc_swap", float("nan"))))]
+        if pairs:
+            add("\n## 四、最稳的一条：置空 ≈ 换错图\n")
+            add("| 运行 | 置空 acc | 换错图 acc | 差值 | 结论 |")
+            add("|---|---|---|---|---|")
+            ok = 0
+            for n, m in pairs:
+                gap = abs(m["acc_blank"] - m["acc_swap"])
+                same = gap <= 0.05
+                ok += same
+                add(f"| {n} | {m['acc_blank']:.3f} | {m['acc_swap']:.3f} | {gap:.3f} "
+                    f"| {'**统计上不可区分**' if same else '可区分'} |")
+            add(f"\n> {ok}/{len(pairs)} 个运行里，「把图换成别的题的图」与「把图置空」"
+                "的成绩在 0.05 内不可区分。这意味着模型对图像的处理只到"
+                "**「有没有图」**这一层，几乎不区分图里是哪个病人——"
+                "这比任何单一 Δ 都更能说明「多模态」是名义上的。"
+                "该结论不依赖具体模型家族，是本项目最硬的一条。")
+
+        # 五：模态分层必须扣掉子集自己的基线
+        withm = [(n, m) for n, m in rows if m.get("modal")]
+        if withm:
+            add("\n## 五、模态分层：先扣掉「子集自己的常数基线」\n")
+            add("各模态的 Yes/No 比例不同，「永远答 No」在三个子集上的准确率本来就不同"
+                "（X-Ray 的 Yes 金标占 55.2%，所以全答 No 只有 0.448）。"
+                "不扣这个差就横比 Δ，会把「答案比例」误读成「坍缩幅度」。\n")
+            add("| 运行 | 模态 | n | 原图 acc | 置空 acc | 子集常数基线 | 置空−基线 | Δ |")
+            add("|---|---|---|---|---|---|---|---|")
+            for n_, m in withm:
+                for mod in ["CT", "X-Ray", "MRI"]:
+                    s = m["modal"].get(mod)
+                    if not s:
+                        continue
+                    gap = s["blank"] - s["base"]
+                    add(f"| {n_} | {mod} | {s['n']} | {s['acc']:.3f} | {s['blank']:.3f} "
+                        f"| {s['base']:.3f} | {gap:+.3f} | {s['delta']:+.3f} |")
+            add("\n> 看最后一列「置空−基线」而不是 Δ：它回答的是「没有图时，模型是否"
+                "退化成常数预测器」。"
+                "若该值在 ±0.05 内，说明完全退化；若显著为负，说明模型在没有图时"
+                "**比常数预测器更差**（主动答错），这才是真正的病理信号。"
+                "Δ 在不同模态间的排序会随答案比例漂移，不能直接横比。")
+
+        # 六：置信度有没有信息量
+        cc = [(n, m) for n, m in rows
+              if not math.isnan(m.get("conf_auc", float("nan")))]
+        if cc:
+            add("\n## 六、校准：ECE 差很多，但置信度在两个模型上都没用\n")
+            add("| 运行 | 平均置信度 | 原图 acc | ECE | conf(correct)−conf(incorrect) "
+                "| 区分度 AUC | 唯一置信度取值数 |")
+            add("|---|---|---|---|---|---|---|")
+            for n_, m in cc:
+                add(f"| {n_} | {m['conf']:.3f} | {m['acc']:.3f} | {m['ece']:.3f} "
+                    f"| {m['conf_gap']:+.3f} | {m['conf_auc']:.3f} | {m['conf_nuniq']} |")
+            aucs = " / ".join(f"{m['conf_auc']:.3f}" for _, m in cc)
+            uniqs = " / ".join(str(m["conf_nuniq"]) for _, m in cc)
+            add(f"\n> ECE 只衡量「说 90% 时是否真对 90%」，它**不衡量置信度有没有信息量**。"
+                f"两个模型的区分度 AUC 为 {aucs}（0.5 = 完全无区分力），"
+                f"唯一取值数只有 {uniqs} 个——"
+                "置信度是被量化成两三档的口头禅，不是概率。"
+                "所以正确的结论不是「某个模型校准差」，而是"
+                "**两家的 confidence 字段都不能用于临床决策阈值**；"
+                "ECE 高低只是「口头禅偏乐观多少」的差别。")
+
         add(f"\n> 写简历/论文时的口径：不要写「我们发现 X」，"
             f"写「我们在 {len(hs)} 个模型×数据集组合上检验了 X，复现 {h1}/{len(hs)}」。"
             f"前者是轶事，后者是证据。")

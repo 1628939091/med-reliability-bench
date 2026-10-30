@@ -2,7 +2,15 @@
   "data_dir": "data/real_slake",
   "max_samples": 0,
   "k_repeats": 1,
-  "perturbations": ["identity", "blank", "noise", "flip", "swap", "low_res", "text_only"],
+  "perturbations": [
+    "identity",
+    "blank",
+    "noise",
+    "flip",
+    "swap",
+    "low_res",
+    "text_only"
+  ],
   "report": "outputs/report_glm45v_fast.md",
   "models": [
     {
@@ -10,7 +18,8 @@
       "name": "GLM-4.5V@SiliconFlow",
       "base_url": "https://api.siliconflow.cn/v1",
       "model": "zai-org/GLM-4.5V",
-      "temperature": 0.0
+      "temperature": 0.0,
+      "max_tokens": 1024
     }
   ]
 }

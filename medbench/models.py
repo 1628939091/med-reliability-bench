@@ -79,12 +79,18 @@ class APITransientError(RuntimeError):
 
 class OpenAICompatVLM:
     def __init__(self, name: str, base_url: str, api_key: str,
-                 model: str, temperature: float = 0.7):
+                 model: str, temperature: float = 0.7,
+                 max_tokens: int | None = None):
         self.name = name
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
         self.temperature = temperature
+        # 有些平台（硅基流动的 GLM 系列）默认 max_tokens 直接等于模型最大
+        # 上下文长度，输入占了 token 后必然溢出：
+        #   400 code 20015 "max_tokens (65536) have exceeded max_seq_len (65536)"
+        # 我们的回答只要一个短 JSON，显式给个上限既避免报错也省钱。
+        self.max_tokens = max_tokens
 
     def answer(self, question, options, gold, image_path, perturbation, rep):
         content: list[dict] = [
@@ -103,11 +109,14 @@ class OpenAICompatVLM:
             content.append({"type": "image_url",
                             "image_url": {"url": f"data:{mime};base64,{b64}"}})
 
-        payload = json.dumps({
+        body = {
             "model": self.model,
             "messages": [{"role": "user", "content": content}],
             "temperature": self.temperature,
-        }).encode()
+        }
+        if self.max_tokens:
+            body["max_tokens"] = int(self.max_tokens)
+        payload = json.dumps(body).encode()
 
         req = urllib.request.Request(
             self.base_url + "/chat/completions", data=payload,
@@ -218,5 +227,6 @@ def build_model(cfg: dict):
         if not api_key:
             raise RuntimeError("缺少 API key：请先在终端设置 $env:MRB_API_KEY=\"sk-...\"")
         return OpenAICompatVLM(cfg["name"], cfg["base_url"], api_key,
-                               cfg["model"], cfg.get("temperature", 0.7))
+                               cfg["model"], cfg.get("temperature", 0.7),
+                               cfg.get("max_tokens"))
     raise ValueError(f"unknown backend: {cfg['backend']}")
