@@ -28,7 +28,9 @@ CKPT = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
     HERE, "outputs", "checkpoint_real_slake_api_full.jsonl")
 DATA = sys.argv[2] if len(sys.argv) > 2 else os.path.join(
     HERE, "data", "real_slake", "dataset.jsonl")
-OUT = os.path.join(HERE, "outputs", "analysis_full.md")
+_stem = os.path.splitext(os.path.basename(CKPT))[0]
+_STEM = _stem.replace("checkpoint_", "", 1) or "run"
+OUT = os.path.join(HERE, "outputs", f"analysis_{_STEM}.md")
 B = 2000
 SEED = 42
 PERTS = ["identity", "blank", "noise", "flip", "swap", "low_res", "text_only"]
@@ -139,6 +141,10 @@ def make_figs(recs, acc_by, ci_by, split):
     out = []
     order = [p for p in PERTS if p in acc_by]
     labels = [f"{p}\n{DESC[p]}" for p in order]
+    _m = recs[0].get("model", "模型")
+    _ds = (recs[0].get("meta") or {})
+    _nq = len({r["sid"] for r in recs})
+    _k = max(r["rep"] for r in recs) + 1
 
     # 图 1：各扰动准确率（带 95%CI）
     fig, ax = plt.subplots(figsize=(9, 4.6), dpi=150)
@@ -159,8 +165,8 @@ def make_figs(recs, acc_by, ci_by, split):
     ax.set_ylim(0, 0.95)
     ax.set_xlim(-0.6, len(order) - 0.4)
     ax.set_ylabel("准确率")
-    ax.set_title("Qwen3-VL-8B 在 SLAKE 闭集题上的扰动剖面（355 题 × 3 次）")
-    p1 = os.path.join(HERE, "outputs", "fig_perturbation.png")
+    ax.set_title(f"{_m} 的扰动剖面（{_nq} 题 × {_k} 次）")
+    p1 = os.path.join(HERE, "outputs", f"fig_perturbation_{_STEM}.png")
     fig.tight_layout()
     fig.savefig(p1)
     plt.close(fig)
@@ -182,8 +188,8 @@ def make_figs(recs, acc_by, ci_by, split):
     ax.set_ylim(0, 1.0)
     ax.set_ylabel("准确率")
     ax.legend(fontsize=8)
-    ax.set_title("同一扰动下两种答案方向的准确率：图像的贡献几乎全在 Yes 题")
-    p2 = os.path.join(HERE, "outputs", "fig_direction.png")
+    ax.set_title(f"{_m}：同一扰动下两种答案方向的准确率（{_nq} 题）")
+    p2 = os.path.join(HERE, "outputs", f"fig_direction_{_STEM}.png")
     fig.tight_layout()
     fig.savefig(p2)
     plt.close(fig)
@@ -202,9 +208,18 @@ def main():
     add = L.append
 
     add(f"- 模型：`{model}`")
-    add(f"- 数据：SLAKE 测试集闭集题 **{n_q}** 题 × {len(perts)} 扰动 × 3 重复 "
+    _dsname = next((m.get("dataset") for m in meta.values()
+                    if (m or {}).get("dataset")), "数据集")
+    _dsname = str(_dsname).replace("_", "-").upper()
+    _k = max(r["rep"] for r in recs) + 1
+    add(f"- 数据：{_dsname} 闭集题 **{n_q}** 题 × {len(perts)} 扰动 × {_k} 重复 "
         f"= **{len(recs)}** 条记录")
-    add(f"- 选项设计：全部 355 题均为 `A. No / B. Yes`，gold 分布 180:175（均衡）")
+    _g = defaultdict(int)
+    for r in recs:
+        if r["perturbation"] == "identity":
+            _g[r["gold"]] += 1
+    _opts = "/".join(f"{k_}({v_})" for k_, v_ in sorted(_g.items()))
+    add(f"- 选项设计：全部 {n_q} 题均为二选一，gold 分布 {_opts}")
     add(f"- 统计口径：按题目聚类 Bootstrap（B={B}）、配对 McNemar 精确检验；"
         f"子组 n<20 标 ⚠️ 仅描述\n")
 
@@ -240,10 +255,14 @@ def main():
     add(f"- 永远答多数类 = **{majority:.3f}**")
     add(f"- 模型原图准确率 {acc_by['identity']:.3f} → 仅比常数基线高 "
         f"**{acc_by['identity']-majority:+.3f}**")
-    add(f"- 而**图像置空时只有 {acc_by['blank']:.3f}**，比「永远答 No」还低 "
-        f"{abs(acc_by['blank']-n_no/n_tot)*100:.1f} 个百分点 → 说明置空条件下模型"
-        f"不是「靠语言先验猜」，而是**退化成了近乎常数的输出**"
-        f"（Yes 率仅 {yesrate['blank']:.3f}，答案熵 {ent_by['blank']:.3f} bit，"
+    gap_b = acc_by['blank'] - n_no / n_tot
+    add(f"- 而**图像置空时为 {acc_by['blank']:.3f}**，"
+        + (f"比「永远答 No」还低 {abs(gap_b)*100:.1f} 个百分点 → 说明置空条件下模型"
+           "不是「靠语言先验猜」，而是**退化成了比常数更差的输出**"
+           if gap_b < 0 else
+           f"与「永远答 No」相差 {gap_b*100:+.1f} 个百分点 → 说明置空条件下模型"
+           "**退化成了常数预测器**，图像信息完全失效")
+        + f"（Yes 率仅 {yesrate['blank']:.3f}，答案熵 {ent_by['blank']:.3f} bit，"
         f"而原图条件下是 {ent_by['identity']:.3f} bit）。")
 
     # ---------- 表 3：坍缩差按方向拆分（核心）
@@ -285,10 +304,20 @@ def main():
         f"错→对 {cb} 题，p = {pv:.2e} → 图像作用"
         f"{'显著' if pv < 0.05 else '不显著'}。")
 
-    # ---------- 表 5：分层
+    # ---------- 表 5：分层（字段随数据集自适应：SLAKE 用 modality/content_type，
+    # VQA-RAD 用 question_type/organ，避免整列「未知」）
     add("\n## 四、分层：哪些题型最容易被图像「反噬」\n")
-    for key, title in [("modality", "影像模态"), ("content_type", "问题类型")]:
-        add(f"\n### 4.{['modality','content_type'].index(key)+1} 按{title}（原图条件）\n")
+    cand = [("modality", "影像模态"), ("content_type", "问题类型"),
+            ("question_type", "问题类型"), ("organ", "解剖部位")]
+    seen_t, strat = set(), []
+    for k, t in cand:
+        if t in seen_t:
+            continue
+        if any((meta.get(s) or {}).get(k) for s in b_i):
+            seen_t.add(t)
+            strat.append((k, t))
+    for ki, (key, title) in enumerate(strat, 1):
+        add(f"\n### 4.{ki} 按{title}（原图条件）\n")
         add(f"| {title} | n 题 | 原图准确率 | Wilson 95%CI | 置空准确率 | Δ |")
         add("|---|---|---|---|---|---|")
         groups = defaultdict(list)
@@ -303,6 +332,8 @@ def main():
             bl = float(np.nanmean([b_b.get(s, np.nan) for s in ss]))
             rows.append((n, g, a, lo, hi, bl, a - bl))
         for n, g, a, lo, hi, bl, dd in sorted(rows, reverse=True):
+            if g == "未知" and len(rows) > 1:      # 字段缺失的散兵不占一行
+                continue
             flag = " ⚠️" if n < 20 else ""
             add(f"| {g}{flag} | {n} | {a:.3f} | [{lo:.3f},{hi:.3f}] | {bl:.3f} "
                 f"| {dd:+.3f} |")
@@ -337,8 +368,12 @@ def main():
         mid = (b + 0.5) / 10
         add(f"| {b/10:.1f}–{(b+1)/10:.1f} | {len(bins[b])} | "
             f"{np.mean(bins[b]):.3f} | {np.mean(bins[b])-mid:+.3f} |")
-    add("\n> 模型几乎全部输出 0.95–0.99 的置信度（熵 0.018），置信度**没有区分度**，"
-        "不能直接用于临床决策阈值；需温度缩放或改为 logit 采样估计。")
+    top_c = max(bins, key=lambda b: len(bins[b]))
+    top_share = len(bins[top_c]) / sum(len(v) for v in bins.values())
+    add(f"\n> 置信度取值只有 **{len(set(confs))}** 个不同值，"
+        f"{top_share:.0%} 的记录落在 {top_c/10:.1f}–{(top_c+1)/10:.1f} 区间；"
+        "置信度**没有区分度**，不能直接用于临床决策阈值；"
+        "需温度缩放或改为 logit 采样估计。")
 
     # ---------- 表 7：稳定性
     add("\n## 六、稳定性\n")
@@ -352,17 +387,29 @@ def main():
     add(f"- pass^3 = **{pass3:.3f}** vs pass@1 = {acc_by['identity']:.3f}，"
         f"差 {acc_by['identity']-pass3:.3f} → 温度 0 下答案高度确定，重复采样几乎无方差")
 
-    # ---------- 结论
-    add("\n## 七、可直接写进论文/简历的四条结论\n")
-    add(f"1. **模态坍缩确实存在但常被误读**：Qwen3-VL-8B 原图准确率 "
+    # ---------- 结论（全部按数据生成，不写死模型名与方向）
+    mname = recs[0].get("model", "被测模型")
+    add("\n## 七、可直接写进论文/简历的结论\n")
+    b_acc = acc_by.get("blank", float("nan"))
+    rel = "低于" if b_acc < majority else "高于"
+    add(f"1. **模态坍缩确实存在但常被误读**：{mname} 原图准确率 "
         f"{acc_by['identity']:.3f}，只比常数基线高 {acc_by['identity']-majority:+.3f}；"
-        f"去掉图像后准确率跌到 {acc_by['blank']:.3f}，低于常数基线。")
+        f"去掉图像后准确率跌到 {b_acc:.3f}，**{rel}**常数基线 {majority:.3f}"
+        f"（差 {b_acc-majority:+.3f}）。"
+        + ("「比常数还差」意味着无图时不是保守猜测，而是主动答错。"
+           if b_acc < majority else
+           "「落在基线附近」意味着无图时退化成常数预测器。"))
     add(f"2. **图像价值高度不对称**：Yes 题 Δ={dy:+.3f} vs No 题 Δ={dn:+.3f}，"
         f"聚合 Δ={d_all:+.3f} 是两者的净和——单一指标会误导。")
-    add(f"3. **「置空图」与「不给图」不等价**：Yes 率 {yesrate['blank']:.3f} vs "
-        f"{yesrate['text_only']:.3f}，说明模型把空图理解为「没有证据→答 No」，"
-        f"把缺图理解为「从文字推断」。评测设计必须区分这两种条件。")
-    add(f"4. **校准是最大短板**：ECE {ece(confs, corrs):.3f}，置信度集中在 0.95+，"
+    if "text_only" in yesrate:
+        add(f"3. **「置空图」与「不给图」不等价**：Yes 率 {yesrate['blank']:.3f} vs "
+            f"{yesrate['text_only']:.3f}，说明模型把空图理解为「没有证据→答 No」，"
+            f"把缺图理解为「从文字推断」。评测设计必须区分这两种条件。")
+    else:
+        add("3. **「置空图」与「不给图」的对照未跑**：本次配置未包含 `text_only` 扰动，"
+            "该结论请参考完整配置的结果。")
+    add(f"4. **置信度不可用于决策阈值**：ECE {ece(confs, corrs):.3f}，"
+        f"只有 {len(set(confs))} 个不同取值、{top_share:.0%} 集中在一档，"
         f"几乎无区分度；而医疗场景恰恰最需要「知道自己不知道」。")
 
     txt = "\n".join(L)
