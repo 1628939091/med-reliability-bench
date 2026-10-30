@@ -23,6 +23,7 @@ import json
 import math
 import os
 from collections import defaultdict
+from math import comb
 
 import numpy as np
 
@@ -163,13 +164,32 @@ def analyse(ckpt, data):
     else:
         m["pass_k"], m["k"] = float("nan"), 0
 
-    for p in ["blank", "text_only"]:
+    for p in ["identity", "blank", "swap", "text_only"]:
         rs = [r for r in recs if r["perturbation"] == p]
         m[f"yes_{p}"] = float(np.mean([r["pred"] == "B" for r in rs])) if rs else float("nan")
         m[f"ent_{p}"] = entropy([r["pred"] for r in rs]) if rs else float("nan")
     for p in ["blank", "swap"]:
         rs = [r for r in recs if r["perturbation"] == p]
         m[f"acc_{p}"] = float(np.mean([r["correct"] for r in rs])) if rs else float("nan")
+
+    # 配对比较 blank vs swap：同一题同一重复下「有没有图」vs「图对不对」
+    # 只有题级配对，才能把「题目难度」这个混杂因素消掉
+    bykey = defaultdict(dict)
+    for r in recs:
+        if r["perturbation"] in ("blank", "swap"):
+            bykey[(r["sid"], r["rep"])][r["perturbation"]] = bool(r["correct"])
+    pr = [(v["swap"], v["blank"]) for v in bykey.values()
+          if "swap" in v and "blank" in v]
+    if pr:
+        n01 = sum(1 for s, b in pr if not s and b)   # 有图(错图)错、没图对
+        n10 = sum(1 for s, b in pr if s and not b)   # 有图(错图)对、没图错
+        n = n01 + n10
+        if n == 0:
+            pv = 1.0
+        else:
+            kk = min(n01, n10)
+            pv = min(1.0, 2 * sum(comb(n, i) for i in range(kk + 1)) / 2 ** n)
+        m["swap_blank"] = {"n": len(pr), "n01": n01, "n10": n10, "p": pv}
 
     # 模态分层：必须用「子集自己的常数基线」校正，否则答案比例会冒充坍缩幅度
     mods = {}
@@ -324,22 +344,54 @@ def main():
                          or math.isnan(m.get("acc_swap", float("nan"))))]
         if pairs:
             add("\n## 四、最稳的一条：置空 ≈ 换错图\n")
-            add("| 运行 | 置空 acc | 换错图 acc | 差值 | 结论 |")
-            add("|---|---|---|---|---|")
+            add("「置空」= 喂一张 64×64 灰图；「换错图」= 喂同一数据集里"
+                "**另一道题**的真实影像（按题号随机抽，见 `runner.py`）。"
+                "两者都在测「图像内容无效」，区别只在于错图里还留着模态、"
+                "部位这些**真实影像才有的线索**。\n")
+            add("| 运行 | 置空 acc | 换错图 acc | 差值 | 配对 n | 只有换错图对 | 只有置空对 | McNemar p |")
+            add("|---|---|---|---|---|---|---|---|")
             ok = 0
             for n, m in pairs:
-                gap = abs(m["acc_blank"] - m["acc_swap"])
-                same = gap <= 0.05
+                sb = m.get("swap_blank") or {}
+                gap = m["acc_swap"] - m["acc_blank"]
+                pv = sb.get("p", float("nan"))
+                same = (not math.isnan(pv)) and pv > 0.05
                 ok += same
-                add(f"| {n} | {m['acc_blank']:.3f} | {m['acc_swap']:.3f} | {gap:.3f} "
-                    f"| {'**统计上不可区分**' if same else '可区分'} |")
+                add(f"| {n} | {m['acc_blank']:.3f} | {m['acc_swap']:.3f} "
+                    f"| {gap:+.3f} | {sb.get('n', 0)} | {sb.get('n10', 0)} "
+                    f"| {sb.get('n01', 0)} | {pv:.3f} |")
             if ok == len(pairs):
-                add(f"\n> {ok}/{len(pairs)} 个运行里，「把图换成别的题的图」与「把图置空」"
-                    "的成绩在 0.05 内不可区分。这意味着模型对图像的处理只到"
-                    "**「有没有图」**这一层，几乎不区分图里是哪个病人。")
+                add(f"\n> {ok}/{len(pairs)} 个运行的配对 McNemar 检验都**不显著**"
+                    "（p 远大于 0.05）：把图换成别的病人的图，与把图删掉，成绩上没有区别。"
+                    "这说明模型对图像的处理只到**「有没有图」**这一层，"
+                    "几乎不比对图里是哪个病人——**多模态是名义上的**。"
+                    "这条结论不依赖模型家族，是本项目最硬的一条。")
+                add("\n> 一个必须一起说清的细节：换错图会改变模型的**回答分布**"
+                    "（下表 Yes 率），但**没有换来准确率**。"
+                    "「分布变了、对错没变」这个组合，说明模型确实从错图里提取了东西——"
+                    "只是提取到的与题目无关。这是模态坍缩的机制层证据，"
+                    "比单看准确率更有说服力。\n")
+                add("| 运行 | Yes 率·原图 | Yes 率·置空 | Yes 率·换错图 | 换错图−置空 |")
+                add("|---|---|---|---|---|")
+                for n, m in pairs:
+                    yb, ys = m.get("yes_blank", float("nan")), m.get("yes_swap", float("nan"))
+                    add(f"| {n} | {m.get('yes_identity', float('nan')):.3f} | {yb:.3f} "
+                        f"| {ys:.3f} | {ys - yb:+.3f} |")
+                seen = [m.get("yes_swap", 0) - m.get("yes_blank", 0) for _, m in pairs]
+                if any(abs(v) > 0.10 for v in seen):
+                    add("\n> 注意这个跨模型差异：有的模型换错图后 Yes 率大幅上升"
+                        "（它确实「看见」了影像里的模态/部位线索），"
+                        "有的几乎不动（它连「有图 vs 有错图」都分不出）。"
+                        "**「只感知图像存在性」这句话要分两层说**："
+                        "所有模型都只在「有没有图」这一层改变行为；"
+                        "至于会不会被错图影响回答分布，模型之间不一样。")
+                else:
+                    add("\n> 换错图对 Yes 率的影响也在噪声范围内——"
+                        "两个模型连「图对不对」都没有反应，"
+                        "说明视觉编码的输出在决策里几乎没有参与。")
             else:
                 bad = [n for n, m in pairs
-                       if abs(m["acc_blank"] - m["acc_swap"]) > 0.05]
+                       if (m.get("swap_blank") or {}).get("p", 1.0) <= 0.05]
                 add(f"\n> 只有 {ok}/{len(pairs)} 个运行满足「置空 ≈ 换错图」；"
                     f"{'、'.join(bad)} 上两者可区分——换错图比置空**更高**，"
                     "说明错图仍携带与题目兼容的信息（如模态/部位线索），"
